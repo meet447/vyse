@@ -1,0 +1,6 @@
+/target
+/target-linux
+**/*.rs.bk
+.DS_Store
+.env
+.env.*

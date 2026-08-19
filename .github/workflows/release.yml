@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin: vyse
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin: vyse
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bin: vyse
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin: vyse.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build -p vyse-cli --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "vyse-${{ matrix.target }}.tar.gz" "${{ matrix.bin }}"
+          mv "vyse-${{ matrix.target }}.tar.gz" "$RUNNER_TEMP/"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path "${{ matrix.bin }}" -DestinationPath "$env:RUNNER_TEMP/vyse-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vyse-${{ matrix.target }}
+          path: ${{ runner.temp }}/vyse-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum vyse-*.tar.gz vyse-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/vyse-*.tar.gz
+            dist/vyse-*.zip
+            dist/SHA256SUMS
