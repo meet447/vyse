@@ -24,3 +24,5 @@ pub const DEFAULT_DOMAIN: &str = "vyse.dev";
 /// Hosted public edge the shipped CLI dials by default.
 pub const HOSTED_EDGE: &str = "vyse.chipling.xyz:4433";
 pub const HOSTED_DOMAIN: &str = "vyse.chipling.xyz";
+pub const GITHUB_OWNER: &str = "meet447";
+pub const GITHUB_REPO: &str = "vyse";

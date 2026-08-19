@@ -1,6 +1,23 @@
+# Build artifacts
 /target
 /target-linux
 **/*.rs.bk
+*.rlib
+*.rmeta
+
+# OS / editor
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets — never commit these
 .env
 .env.*
+!.env.example
+
+# Local ops (Caddy, systemd, VPS notes) — keep on this machine only
+/deploy/

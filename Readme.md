@@ -10,13 +10,15 @@
 
 ---
 
-**Vyse** exposes a local HTTP server on a public URL over a QUIC tunnel. The hosted edge speaks **HTTP/3** (with HTTP/1.1 fallback for webhook senders). Your laptop stays connected over **QUIC**, so a Wi-Fi → cellular switch keeps the same session. Incoming webhooks are logged locally so you can inspect and replay them — no third-party dashboard.
+**Vyse** exposes a local HTTP server on a public URL over a QUIC tunnel. The edge speaks **HTTP/3** (with HTTP/1.1 fallback for webhook senders). Your laptop stays connected over **QUIC**, so a Wi-Fi → cellular switch keeps the same session. Incoming webhooks are logged locally so you can inspect and replay them — no third-party dashboard.
+
+This repository is **open source** (dual-licensed MIT OR Apache-2.0) and also powers the **hosted** edge at `vyse.chipling.xyz`. The default CLI talks to production out of the box; you can self-host your own edge from the same code.
 
 See [Product.md](Product.md) for the full product spec and roadmap.
 
-## Install
+## Hosted (production)
 
-**macOS / Linux (recommended):**
+Install the CLI (macOS / Linux):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/meet447/vyse/main/install.sh | bash
@@ -24,41 +26,33 @@ curl -fsSL https://raw.githubusercontent.com/meet447/vyse/main/install.sh | bash
 
 Add the install directory to your shell `PATH` if the script tells you to (default: `~/.vyse/bin`).
 
-**Manual download:** pick your platform from [GitHub Releases](https://github.com/meet447/vyse/releases/latest) and put the `vyse` binary on your `PATH`.
-
-## Quickstart
-
-Start your local app (any port):
+Start your local app, then claim a public URL:
 
 ```bash
-python3 -m http.server 3000
+python3 -m http.server 3000   # in one terminal
+vyse serve 3000               # in another
 ```
 
-In another terminal, claim a public URL and forward traffic to it:
-
-```bash
-vyse serve 3000
-```
-
-On first run, Vyse asks for a subdomain (for example `my-app`). That choice is saved locally — the next `vyse serve` reuses it.
-
-Your persistent public URL:
+On **first run**, Vyse prompts for a subdomain (for example `my-app`). That name is reserved for your machine and saved locally — later `vyse serve` calls reuse it:
 
 ```text
 https://my-app.vyse.chipling.xyz
 ```
 
-Press **Ctrl+C** to stop the tunnel.
+Run **`vyse serve`** again on a **different port** while your reserved tunnel is still active to get a **random ephemeral URL** for that session.
 
-## Webhook replay
-
-While a tunnel is live, Vyse shows a terminal UI with the last 500 captured requests. Replay any of them:
+**Webhook replay** — while a tunnel is live, the terminal UI shows captured requests. Replay any of them:
 
 ```bash
 vyse replay <id>
 ```
 
-## Advanced
+**Update the CLI** — same as other CLIs:
+
+```bash
+vyse update          # install latest GitHub release
+vyse update --check  # print status only
+```
 
 **Multi-port routing** — one URL, several local services:
 
@@ -66,19 +60,27 @@ vyse replay <id>
 vyse serve 3000 --route "/api=8000" --route "/=3000"
 ```
 
-**Run the edge locally** (for contributors):
+Manual downloads: [GitHub Releases](https://github.com/meet447/vyse/releases/latest).
+
+## Open source / self-host
+
+Fork the repo, run tests, and operate your own edge. Full instructions: **[docs/self-host.md](docs/self-host.md)**.
+
+| Crate | Binary | Role |
+| --- | --- | --- |
+| [`vyse-core`](crates/vyse-core) | — | Protocol, QUIC helpers, routing |
+| [`vyse-edge`](crates/vyse-edge) | `vyse-edge` | Public gateway and tunnel registry |
+| [`vyse-cli`](crates/vyse-cli) | `vyse` | Local daemon, webhook log, TUI |
+
+Quick local stack:
 
 ```bash
-cargo run -p vyse-edge
+cargo run -p vyse-edge -- --quic 0.0.0.0:4433 --http 127.0.0.1:8080 --http3 127.0.0.1:8443 --domain localhost --public-base http://localhost:8080
+
+vyse serve 3000 --edge 127.0.0.1:4433 --server-name localhost --subdomain my-app
 ```
 
-Then point the CLI at your local edge:
-
-```bash
-vyse tunnel --edge 127.0.0.1:4433 --port 3000 --subdomain my-app
-```
-
-(`tunnel` is a hidden alias; `serve` is the supported command for the hosted edge.)
+Production ops for the hosted service live in a private, gitignored `/deploy/` directory on maintainer machines — not in this tree.
 
 ## Architecture
 
@@ -95,9 +97,7 @@ graph TD
 
 ## Contributing
 
-Vyse is in active development. See [Product.md](Product.md) for what ships in v1 vs later add-ons (Wasm middleware, eBPF, MASQUE datagrams).
-
-To hack on the repo:
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short:
 
 ```bash
 git clone https://github.com/meet447/vyse
@@ -105,7 +105,9 @@ cd vyse
 cargo test --workspace
 ```
 
-## Releasing
+Product details: [Product.md](Product.md) · [docs/product.md](docs/product.md)
+
+## Releasing (maintainers)
 
 Tag a version to build binaries for Linux, macOS (Intel + Apple Silicon), and Windows, then publish a GitHub Release:
 
@@ -118,4 +120,4 @@ The [release workflow](.github/workflows/release.yml) uploads `vyse-<target>.tar
 
 ## License
 
-Vyse is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE-APACHE).
+Vyse is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE-APACHE), at your option.

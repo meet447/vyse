@@ -164,20 +164,124 @@ async fn read_until_headers<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<
     }
 }
 
+const MAX_HTTP_BODY: usize = 32 * 1024 * 1024;
+
+async fn read_more<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> Result<()> {
+    let mut tmp = [0u8; 16 * 1024];
+    let n = reader.read(&mut tmp).await.context("read HTTP body")?;
+    if n == 0 {
+        bail!("connection closed before HTTP body completed");
+    }
+    buf.extend_from_slice(&tmp[..n]);
+    if buf.len() > MAX_HTTP_BODY + 64 * 1024 {
+        bail!("HTTP body too large");
+    }
+    Ok(())
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Decode a chunked HTTP/1.1 body. Returns the decoded payload.
+async fn read_chunked_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut buf: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let mut pos = 0usize;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = loop {
+            if let Some(rel) = find_crlf(&buf[pos..]) {
+                break pos + rel;
+            }
+            read_more(reader, &mut buf).await?;
+        };
+        let line = std::str::from_utf8(&buf[pos..line_end]).context("chunk size line")?;
+        let size_hex = line.split(';').next().unwrap_or(line).trim();
+        let size = usize::from_str_radix(size_hex, 16).context("invalid chunk size")?;
+        pos = line_end + 2;
+
+        if size == 0 {
+            loop {
+                if buf[pos..].starts_with(b"\r\n")
+                    || buf[pos..]
+                        .windows(4)
+                        .any(|w| w == b"\r\n\r\n")
+                {
+                    if decoded.len() > MAX_HTTP_BODY {
+                        bail!("HTTP body too large");
+                    }
+                    return Ok(decoded);
+                }
+                read_more(reader, &mut buf).await?;
+            }
+        }
+
+        while buf.len() < pos + size + 2 {
+            read_more(reader, &mut buf).await?;
+        }
+        decoded.extend_from_slice(&buf[pos..pos + size]);
+        if &buf[pos + size..pos + size + 2] != b"\r\n" {
+            bail!("missing CRLF after chunk data");
+        }
+        pos += size + 2;
+        if decoded.len() > MAX_HTTP_BODY {
+            bail!("HTTP body too large");
+        }
+    }
+}
+
+fn headers_with_content_length(head: &[u8], body_len: usize) -> Result<Vec<u8>> {
+    let end = header_end(head).context("incomplete HTTP headers")?;
+    let sep = if end >= 4 && head[end - 4..end] == *b"\r\n\r\n" {
+        4
+    } else {
+        2
+    };
+    let block = &head[..end - sep];
+    let text = String::from_utf8_lossy(block);
+    let sep_str = if sep == 4 { "\r\n" } else { "\n" };
+    let mut out = String::new();
+    for (i, line) in text.split(sep_str).enumerate() {
+        if i == 0 {
+            out.push_str(line);
+            out.push_str(sep_str);
+            continue;
+        }
+        let name = line.split_once(':').map(|(n, _)| n.trim()).unwrap_or("");
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        if !line.is_empty() {
+            out.push_str(line);
+            out.push_str(sep_str);
+        }
+    }
+    out.push_str(&format!("Content-Length: {body_len}{sep_str}{sep_str}"));
+    Ok(out.into_bytes())
+}
+
 async fn read_body_after_head<R: AsyncRead + Unpin>(
     reader: &mut R,
     mut buf: Vec<u8>,
     expect_body: bool,
 ) -> Result<Vec<u8>> {
-    if is_chunked(&buf) {
-        bail!("chunked transfer encoding is not supported yet");
-    }
     let end = header_end(&buf).context("incomplete HTTP headers")?;
-    let want = if expect_body {
-        content_length(&buf).unwrap_or(0)
-    } else {
-        0
-    };
+    if !expect_body {
+        buf.truncate(end);
+        return Ok(buf);
+    }
+    if is_chunked(&buf) {
+        let leftover = buf[end..].to_vec();
+        let body = read_chunked_body(reader, leftover).await?;
+        let mut out = headers_with_content_length(&buf[..end], body.len())?;
+        out.extend_from_slice(&body);
+        return Ok(out);
+    }
+    let want = content_length(&buf).unwrap_or(0);
     while buf.len() - end < want {
         let mut tmp = vec![0u8; (want - (buf.len() - end)).min(16 * 1024)];
         let n = reader.read(&mut tmp).await.context("read HTTP body")?;
@@ -190,7 +294,7 @@ async fn read_body_after_head<R: AsyncRead + Unpin>(
     Ok(buf)
 }
 
-/// Read a full HTTP/1.1 request (headers + Content-Length body).
+/// Read a full HTTP/1.1 request (headers + Content-Length or chunked body).
 pub async fn read_http_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let head = read_until_headers(reader).await?;
     read_body_after_head(reader, head, true).await
@@ -258,6 +362,7 @@ pub fn parse_http1_response(raw: &[u8]) -> Result<ParsedResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn extracts_from_host_header() {
@@ -294,5 +399,56 @@ mod tests {
         let parsed = parse_http1_response(raw).unwrap();
         assert_eq!(parsed.status, 201);
         assert_eq!(parsed.body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn reads_chunked_response() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let raw = read_http_response(&mut client, "GET").await.unwrap();
+        let parsed = parse_http1_response(&raw).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, b"hello world");
+        assert_eq!(content_length(&raw), Some(11));
+        assert!(!is_chunked(&raw));
+    }
+
+    #[tokio::test]
+    async fn reads_chunked_with_extensions_and_trailers() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+4;ext=1\r\nping\r\n0\r\nX-Trailer: yes\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let raw = read_http_response(&mut client, "GET").await.unwrap();
+        assert_eq!(parse_http1_response(&raw).unwrap().body, b"ping");
+    }
+
+    #[tokio::test]
+    async fn head_ignores_chunked_body() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let raw = read_http_response(&mut client, "HEAD").await.unwrap();
+        assert_eq!(response_status(&raw), Some(200));
+        let end = header_end(&raw).unwrap();
+        assert_eq!(raw.len(), end);
     }
 }

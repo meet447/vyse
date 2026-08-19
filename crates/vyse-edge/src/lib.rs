@@ -65,6 +65,10 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    fn contains(&self, subdomain: &str) -> bool {
+        self.inner.contains_key(subdomain)
+    }
+
     fn insert(&self, subdomain: String, tunnel: Tunnel) -> Result<(), String> {
         if self.inner.contains_key(&subdomain) {
             return Err(format!("subdomain `{subdomain}` is already in use"));
@@ -79,6 +83,158 @@ impl Registry {
 
     fn remove(&self, subdomain: &str) {
         self.inner.remove(subdomain);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedTunnel {
+    pub subdomain: String,
+    pub ephemeral: bool,
+}
+
+fn allocate_ephemeral(is_active: &impl Fn(&str) -> bool, claims: &ClaimStore) -> String {
+    loop {
+        let candidate = random_subdomain();
+        if is_active(&candidate) {
+            continue;
+        }
+        if claims.is_claimed(&candidate) {
+            continue;
+        }
+        return candidate;
+    }
+}
+
+fn resolve_tunnel_subdomain(
+    requested: Option<String>,
+    is_active: &impl Fn(&str) -> bool,
+    claims: &ClaimStore,
+    machine_id: Option<&str>,
+) -> Result<ResolvedTunnel, String> {
+    if claims.requires_machine_id() {
+        let owner_id = machine_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "this Vyse edge requires a machine id".to_string())?;
+        resolve_production_subdomain(requested, is_active, claims, owner_id)
+    } else {
+        resolve_local_subdomain(requested, is_active)
+    }
+}
+
+fn resolve_local_subdomain(
+    requested: Option<String>,
+    is_active: &impl Fn(&str) -> bool,
+) -> Result<ResolvedTunnel, String> {
+    match requested {
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            validate_subdomain(&name)?;
+            if is_active(&name) {
+                return Err(format!("subdomain `{name}` is already in use"));
+            }
+            Ok(ResolvedTunnel {
+                subdomain: name,
+                ephemeral: false,
+            })
+        }
+        None => {
+            let subdomain = loop {
+                let candidate = random_subdomain();
+                if !is_active(&candidate) {
+                    break candidate;
+                }
+            };
+            Ok(ResolvedTunnel {
+                subdomain,
+                ephemeral: false,
+            })
+        }
+    }
+}
+
+fn resolve_production_subdomain(
+    requested: Option<String>,
+    is_active: &impl Fn(&str) -> bool,
+    claims: &ClaimStore,
+    owner_id: &str,
+) -> Result<ResolvedTunnel, String> {
+    match requested {
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            validate_subdomain(&name)?;
+
+            if let Some(owner) = claims.owner(&name) {
+                if owner != owner_id {
+                    return Err(format!("subdomain `{name}` is bound to another machine"));
+                }
+            }
+
+            if let Some(reserved) = claims.reserved_of(owner_id) {
+                if reserved != name {
+                    return resolve_using_reserved(is_active, claims, &reserved);
+                }
+                if is_active(&reserved) {
+                    Ok(ResolvedTunnel {
+                        subdomain: allocate_ephemeral(is_active, claims),
+                        ephemeral: true,
+                    })
+                } else {
+                    Ok(ResolvedTunnel {
+                        subdomain: reserved,
+                        ephemeral: false,
+                    })
+                }
+            } else if is_active(&name) {
+                Ok(ResolvedTunnel {
+                    subdomain: allocate_ephemeral(is_active, claims),
+                    ephemeral: true,
+                })
+            } else {
+                claims.claim_reserved(&name, owner_id)?;
+                Ok(ResolvedTunnel {
+                    subdomain: name,
+                    ephemeral: false,
+                })
+            }
+        }
+        None => {
+            if let Some(reserved) = claims.reserved_of(owner_id) {
+                if is_active(&reserved) {
+                    Ok(ResolvedTunnel {
+                        subdomain: allocate_ephemeral(is_active, claims),
+                        ephemeral: true,
+                    })
+                } else {
+                    Ok(ResolvedTunnel {
+                        subdomain: reserved,
+                        ephemeral: false,
+                    })
+                }
+            } else {
+                Ok(ResolvedTunnel {
+                    subdomain: allocate_ephemeral(is_active, claims),
+                    ephemeral: true,
+                })
+            }
+        }
+    }
+}
+
+fn resolve_using_reserved(
+    is_active: &impl Fn(&str) -> bool,
+    claims: &ClaimStore,
+    reserved: &str,
+) -> Result<ResolvedTunnel, String> {
+    if is_active(reserved) {
+        Ok(ResolvedTunnel {
+            subdomain: allocate_ephemeral(is_active, claims),
+            ephemeral: true,
+        })
+    } else {
+        Ok(ResolvedTunnel {
+            subdomain: reserved.to_string(),
+            ephemeral: false,
+        })
     }
 }
 
@@ -293,68 +449,27 @@ async fn handle_tunnel(
         bail!(message);
     }
 
-    let subdomain = match requested {
-        Some(name) => {
-            let name = name.to_ascii_lowercase();
-            if let Err(err) = validate_subdomain(&name) {
-                write_msg(
-                    &mut send,
-                    &ControlMessage::Error {
-                        message: err.clone(),
-                    },
-                )
-                .await?;
-                bail!(err);
-            }
-            name
+    let ResolvedTunnel {
+        subdomain,
+        ephemeral,
+    } = match resolve_tunnel_subdomain(
+        requested,
+        &|subdomain| registry.contains(subdomain),
+        &claims,
+        machine_id.as_deref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            write_msg(
+                &mut send,
+                &ControlMessage::Error {
+                    message: err.clone(),
+                },
+            )
+            .await?;
+            bail!(err);
         }
-        None => loop {
-            let candidate = random_subdomain();
-            if registry.inner.contains_key(&candidate) {
-                continue;
-            }
-            if enforce_claims {
-                let owner_id = machine_id.as_deref().expect("checked above");
-                if !claims.is_available_for(&candidate, owner_id) {
-                    continue;
-                }
-            }
-            break candidate;
-        },
     };
-
-    if enforce_claims {
-        let owner_id = machine_id.as_deref().expect("checked above");
-        if let Err(err) = claims.assert_owner(&subdomain, owner_id) {
-            write_msg(
-                &mut send,
-                &ControlMessage::Error {
-                    message: err.clone(),
-                },
-            )
-            .await?;
-            bail!(err);
-        }
-    }
-
-    if let Some(existing) = registry.get(&subdomain) {
-        let can_replace = enforce_claims
-            && claims.owner(&subdomain).as_deref() == machine_id.as_deref();
-        if can_replace {
-            existing.conn.close(0u32.into(), b"replaced");
-            registry.remove(&subdomain);
-        } else {
-            let err = format!("subdomain `{subdomain}` is already in use");
-            write_msg(
-                &mut send,
-                &ControlMessage::Error {
-                    message: err.clone(),
-                },
-            )
-            .await?;
-            bail!(err);
-        }
-    }
 
     if let Err(err) = registry.insert(
         subdomain.clone(),
@@ -379,6 +494,7 @@ async fn handle_tunnel(
         &ControlMessage::Registered {
             subdomain: subdomain.clone(),
             public_url: url.clone(),
+            ephemeral,
         },
     )
     .await?;
@@ -487,5 +603,79 @@ mod tests {
     fn production_custom_domain_url() {
         let url = public_url("https://vyse.chipling.xyz", "demo", "vyse.chipling.xyz");
         assert_eq!(url, "https://demo.vyse.chipling.xyz");
+    }
+
+    #[test]
+    fn local_mode_rejects_duplicate_subdomain() {
+        let active = |s: &str| s == "demo";
+        let claims = ClaimStore::open(None).unwrap();
+        let err =
+            resolve_tunnel_subdomain(Some("demo".into()), &active, &claims, None).unwrap_err();
+        assert_eq!(err, "subdomain `demo` is already in use");
+    }
+
+    #[test]
+    fn production_first_claim_is_reserved() {
+        let active = |_s: &str| false;
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ClaimStore::open(Some(dir.path().join("claims.db"))).unwrap();
+
+        let resolved =
+            resolve_tunnel_subdomain(Some("demo".into()), &active, &claims, Some("hw-a")).unwrap();
+        assert_eq!(resolved.subdomain, "demo");
+        assert!(!resolved.ephemeral);
+        assert_eq!(claims.reserved_of("hw-a"), Some("demo".into()));
+    }
+
+    #[test]
+    fn production_extra_tunnel_gets_ephemeral_when_reserved_active() {
+        let active = |s: &str| s == "demo";
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ClaimStore::open(Some(dir.path().join("claims.db"))).unwrap();
+        claims.claim_reserved("demo", "hw-a").unwrap();
+
+        let resolved =
+            resolve_tunnel_subdomain(Some("demo".into()), &active, &claims, Some("hw-a")).unwrap();
+        assert_ne!(resolved.subdomain, "demo");
+        assert!(resolved.ephemeral);
+        assert_eq!(resolved.subdomain.len(), 8);
+    }
+
+    #[test]
+    fn production_reuses_reserved_when_not_active() {
+        let active = |_s: &str| false;
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ClaimStore::open(Some(dir.path().join("claims.db"))).unwrap();
+        claims.claim_reserved("demo", "hw-a").unwrap();
+
+        let resolved =
+            resolve_tunnel_subdomain(Some("demo".into()), &active, &claims, Some("hw-a")).unwrap();
+        assert_eq!(resolved.subdomain, "demo");
+        assert!(!resolved.ephemeral);
+    }
+
+    #[test]
+    fn production_redirects_to_reserved_when_requesting_different_name() {
+        let active = |_s: &str| false;
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ClaimStore::open(Some(dir.path().join("claims.db"))).unwrap();
+        claims.claim_reserved("foo", "hw-a").unwrap();
+
+        let resolved =
+            resolve_tunnel_subdomain(Some("bar".into()), &active, &claims, Some("hw-a")).unwrap();
+        assert_eq!(resolved.subdomain, "foo");
+        assert!(!resolved.ephemeral);
+    }
+
+    #[test]
+    fn production_other_machine_subdomain_is_rejected() {
+        let active = |_s: &str| false;
+        let dir = tempfile::tempdir().unwrap();
+        let claims = ClaimStore::open(Some(dir.path().join("claims.db"))).unwrap();
+        claims.claim_reserved("demo", "hw-a").unwrap();
+
+        let err =
+            resolve_tunnel_subdomain(Some("demo".into()), &active, &claims, Some("hw-b")).unwrap_err();
+        assert_eq!(err, "subdomain `demo` is bound to another machine");
     }
 }

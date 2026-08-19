@@ -1,5 +1,5 @@
 use std::io::{self, stdout};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,12 +17,13 @@ pub fn run_tui(
     public_url: String,
     rx: mpsc::Receiver<LoggedRequest>,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    update_notice: Option<Arc<Mutex<Option<String>>>>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = event_loop(&mut terminal, public_url, rx, quit);
+    let result = event_loop(&mut terminal, public_url, rx, quit, update_notice);
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     result
@@ -33,8 +34,10 @@ fn event_loop(
     public_url: String,
     rx: mpsc::Receiver<LoggedRequest>,
     quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    update_notice: Option<Arc<Mutex<Option<String>>>>,
 ) -> Result<()> {
     let mut items: Vec<LoggedRequest> = Vec::new();
+    let mut footer = "Replay later with: vyse replay <id>".to_string();
     loop {
         if quit.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -42,6 +45,13 @@ fn event_loop(
         while let Ok(row) = rx.try_recv() {
             items.insert(0, row);
             items.truncate(50);
+        }
+        if let Some(notice) = update_notice.as_ref()
+            && let Ok(guard) = notice.lock()
+            && let Some(message) = guard.as_ref()
+        {
+            footer = format!("Replay later with: vyse replay <id>  ·  vyse update");
+            let _ = message;
         }
         terminal.draw(|frame| {
             let chunks = Layout::default()
@@ -79,7 +89,7 @@ fn event_loop(
                 chunks[1],
             );
             frame.render_widget(
-                Paragraph::new("Replay later with: vyse replay <id>"),
+                Paragraph::new(footer.as_str()),
                 chunks[2],
             );
         })?;

@@ -11,6 +11,9 @@ use vyse_core::protocol::validate_subdomain;
 struct ConfigFile {
     subdomain: Option<String>,
     machine_id: Option<String>,
+    /// Unix timestamp of the last background update check.
+    #[serde(default)]
+    last_update_check: Option<i64>,
 }
 
 pub struct Config {
@@ -112,6 +115,28 @@ impl Config {
         self.save()?;
         Ok(subdomain)
     }
+
+    const UPDATE_CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+    pub fn should_check_updates(&self) -> bool {
+        let Some(last) = self.data.last_update_check else {
+            return true;
+        };
+        let now = unix_now();
+        now.saturating_sub(last) >= Self::UPDATE_CHECK_INTERVAL_SECS
+    }
+
+    pub fn record_update_check(&mut self) -> Result<()> {
+        self.data.last_update_check = Some(unix_now());
+        self.save()
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn derive_machine_id() -> String {
@@ -235,6 +260,52 @@ mod tests {
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.subdomain(), Some("my-app"));
         assert_eq!(loaded.data.machine_id.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn ensure_subdomain_explicit_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::load_from(&path).unwrap();
+        config.data.subdomain = Some("old-name".into());
+        config.save_to(&path).unwrap();
+
+        let mut config = Config::load_from(&path).unwrap();
+        let subdomain = config
+            .ensure_subdomain(Some("new-name".into()))
+            .unwrap();
+        assert_eq!(subdomain, "new-name");
+        assert_eq!(Config::load_from(&path).unwrap().subdomain(), Some("new-name"));
+    }
+
+    #[test]
+    fn ensure_subdomain_omitted_keeps_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::load_from(&path).unwrap();
+        config.data.subdomain = Some("saved-name".into());
+        config.save_to(&path).unwrap();
+
+        let mut config = Config::load_from(&path).unwrap();
+        let subdomain = config.ensure_subdomain(None).unwrap();
+        assert_eq!(subdomain, "saved-name");
+        assert_eq!(Config::load_from(&path).unwrap().subdomain(), Some("saved-name"));
+    }
+
+    #[test]
+    fn last_update_check_defaults_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let config = Config::load_from(&path).unwrap();
+        assert!(config.should_check_updates());
+        assert_eq!(config.data.last_update_check, None);
+
+        let mut config = Config::load_from(&path).unwrap();
+        config.record_update_check().unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.data.last_update_check.is_some());
+        assert!(!loaded.should_check_updates());
     }
 
     #[test]

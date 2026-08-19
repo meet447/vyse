@@ -55,6 +55,10 @@ pub enum ControlMessage {
     Registered {
         subdomain: String,
         public_url: String,
+        /// True when this session used a random ngrok-style name because the
+        /// reserved subdomain was already in use (or the machine already has one).
+        #[serde(default)]
+        ephemeral: bool,
     },
     Error {
         message: String,

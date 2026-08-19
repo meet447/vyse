@@ -272,3 +272,61 @@ async fn webhook_log_captures_request() {
     assert_eq!(recent[0].path, "/hook");
     assert_eq!(recent[0].body, b"ping");
 }
+
+async fn spawn_chunked(body: &'static [u8]) -> u16 {
+    let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = app.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = app.accept().await.unwrap();
+            let body = body.to_vec();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn chunked_origin_response_is_tunneled() {
+    let app_port = spawn_chunked(b"chunk-ok").await;
+    let (http_addr, quic_addr, _) = spawn_edge().await;
+
+    let session = TunnelSession::connect(TunnelOptions {
+        port: Some(app_port),
+        subdomain: Some("chunk".into()),
+        edge: quic_addr.to_string(),
+        db_path: temp_db(),
+        tui: false,
+        ..TunnelOptions::default()
+    })
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = session.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(http_addr).await.unwrap();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: chunk.vyse.dev\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp))
+        .await
+        .expect("response timed out")
+        .unwrap();
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.contains("chunk-ok"), "unexpected response: {text}");
+    assert!(text.contains("Content-Length: 8"), "{text}");
+}

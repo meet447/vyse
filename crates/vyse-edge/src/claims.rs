@@ -8,22 +8,29 @@ use rusqlite::{Connection, params};
 #[derive(Clone)]
 pub struct ClaimStore {
     inner: Arc<DashMap<String, String>>,
+    by_machine: Arc<DashMap<String, String>>,
     db_path: Option<PathBuf>,
 }
 
 impl ClaimStore {
     pub fn open(db_path: Option<PathBuf>) -> Result<Self, String> {
         let inner = Arc::new(DashMap::new());
+        let by_machine = Arc::new(DashMap::new());
         if let Some(ref path) = db_path {
-            load_sqlite(path, &inner)?;
+            load_sqlite(path, &inner, &by_machine)?;
         }
-        Ok(Self { inner, db_path })
+        Ok(Self {
+            inner,
+            by_machine,
+            db_path,
+        })
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            by_machine: Arc::new(DashMap::new()),
             db_path: None,
         }
     }
@@ -32,7 +39,13 @@ impl ClaimStore {
         self.db_path.is_some()
     }
 
-    pub fn assert_owner(&self, subdomain: &str, machine_id: &str) -> Result<(), String> {
+    pub fn reserved_of(&self, machine_id: &str) -> Option<String> {
+        self.by_machine
+            .get(machine_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn claim_reserved(&self, subdomain: &str, machine_id: &str) -> Result<(), String> {
         if machine_id.is_empty() {
             return Err("this Vyse edge requires a machine id".into());
         }
@@ -42,9 +55,17 @@ impl ClaimStore {
             }
             return Err(format!("subdomain `{subdomain}` is bound to another machine"));
         }
+        if let Some(existing) = self.by_machine.get(machine_id) {
+            let reserved = existing.value();
+            if reserved != subdomain {
+                return Err(format!("machine already reserved `{reserved}`"));
+            }
+        }
 
         self.inner
             .insert(subdomain.to_string(), machine_id.to_string());
+        self.by_machine
+            .insert(machine_id.to_string(), subdomain.to_string());
         if let Some(ref path) = self.db_path {
             persist_claim(path, subdomain, machine_id)?;
         }
@@ -55,15 +76,16 @@ impl ClaimStore {
         self.inner.get(subdomain).map(|entry| entry.value().clone())
     }
 
-    pub fn is_available_for(&self, subdomain: &str, machine_id: &str) -> bool {
-        match self.inner.get(subdomain) {
-            None => true,
-            Some(existing) => existing.value() == machine_id,
-        }
+    pub fn is_claimed(&self, subdomain: &str) -> bool {
+        self.inner.contains_key(subdomain)
     }
 }
 
-fn load_sqlite(path: &Path, inner: &DashMap<String, String>) -> Result<(), String> {
+fn load_sqlite(
+    path: &Path,
+    inner: &DashMap<String, String>,
+    by_machine: &DashMap<String, String>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -77,6 +99,11 @@ fn load_sqlite(path: &Path, inner: &DashMap<String, String>) -> Result<(), Strin
         [],
     )
     .map_err(|err| err.to_string())?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS claims_machine_id ON claims(machine_id)",
+        [],
+    )
+    .map_err(|err| err.to_string())?;
 
     let mut stmt = conn
         .prepare("SELECT subdomain, machine_id FROM claims")
@@ -86,7 +113,8 @@ fn load_sqlite(path: &Path, inner: &DashMap<String, String>) -> Result<(), Strin
         .map_err(|err| err.to_string())?;
     for row in rows {
         let (subdomain, machine_id) = row.map_err(|err| err.to_string())?;
-        inner.insert(subdomain, machine_id);
+        inner.insert(subdomain.clone(), machine_id.clone());
+        by_machine.insert(machine_id, subdomain);
     }
     Ok(())
 }
@@ -112,30 +140,40 @@ mod tests {
     #[test]
     fn first_claim_wins_in_memory() {
         let claims = ClaimStore::in_memory();
-        claims.assert_owner("demo", "hw-a").unwrap();
+        claims.claim_reserved("demo", "hw-a").unwrap();
         assert_eq!(claims.owner("demo"), Some("hw-a".into()));
+        assert_eq!(claims.reserved_of("hw-a"), Some("demo".into()));
     }
 
     #[test]
     fn same_id_reconnects_in_memory() {
         let claims = ClaimStore::in_memory();
-        claims.assert_owner("demo", "hw-a").unwrap();
-        claims.assert_owner("demo", "hw-a").unwrap();
+        claims.claim_reserved("demo", "hw-a").unwrap();
+        claims.claim_reserved("demo", "hw-a").unwrap();
     }
 
     #[test]
     fn other_id_rejected_in_memory() {
         let claims = ClaimStore::in_memory();
-        claims.assert_owner("demo", "hw-a").unwrap();
-        let err = claims.assert_owner("demo", "hw-b").unwrap_err();
+        claims.claim_reserved("demo", "hw-a").unwrap();
+        let err = claims.claim_reserved("demo", "hw-b").unwrap_err();
         assert_eq!(err, "subdomain `demo` is bound to another machine");
     }
 
     #[test]
     fn empty_machine_id_rejected() {
         let claims = ClaimStore::in_memory();
-        let err = claims.assert_owner("demo", "").unwrap_err();
+        let err = claims.claim_reserved("demo", "").unwrap_err();
         assert_eq!(err, "this Vyse edge requires a machine id");
+    }
+
+    #[test]
+    fn one_reserved_per_machine() {
+        let claims = ClaimStore::in_memory();
+        claims.claim_reserved("foo", "hw-a").unwrap();
+        let err = claims.claim_reserved("bar", "hw-a").unwrap_err();
+        assert_eq!(err, "machine already reserved `foo`");
+        assert_eq!(claims.reserved_of("hw-a"), Some("foo".into()));
     }
 
     #[test]
@@ -145,12 +183,33 @@ mod tests {
 
         {
             let claims = ClaimStore::open(Some(path.clone())).unwrap();
-            claims.assert_owner("demo", "hw-a").unwrap();
+            claims.claim_reserved("demo", "hw-a").unwrap();
         }
 
         let claims = ClaimStore::open(Some(path)).unwrap();
         assert_eq!(claims.owner("demo"), Some("hw-a".into()));
-        claims.assert_owner("demo", "hw-a").unwrap();
-        assert!(claims.assert_owner("demo", "hw-b").is_err());
+        assert_eq!(claims.reserved_of("hw-a"), Some("demo".into()));
+        claims.claim_reserved("demo", "hw-a").unwrap();
+        assert!(claims.claim_reserved("demo", "hw-b").is_err());
+    }
+
+    #[test]
+    fn sqlite_rejects_second_subdomain_for_same_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.db");
+        let claims = ClaimStore::open(Some(path.clone())).unwrap();
+        claims.claim_reserved("foo", "hw-a").unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO claims (subdomain, machine_id, created_at) VALUES (?1, ?2, ?3)",
+                params!["bar", "hw-a", 1_i64],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "expected unique constraint violation, got {err}"
+        );
     }
 }

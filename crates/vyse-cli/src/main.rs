@@ -1,9 +1,12 @@
 mod config;
+mod update;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use vyse_cli::{RequestStore, TunnelOptions, replay, run_tunnel};
 use vyse_core::protocol::Route;
@@ -47,6 +50,12 @@ enum Commands {
         /// Disable the live webhook TUI.
         #[arg(long, hide = true)]
         no_tui: bool,
+    },
+    /// Download and install the latest Vyse release from GitHub.
+    Update {
+        /// Check for updates without installing.
+        #[arg(long)]
+        check: bool,
     },
     /// Resend a captured webhook to localhost.
     Replay {
@@ -94,7 +103,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let default_filter = match cli.command {
         Commands::Serve { .. } | Commands::Tunnel { .. } => "warn",
-        Commands::Replay { .. } => "info",
+        Commands::Replay { .. } | Commands::Update { .. } => "info",
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -145,6 +154,11 @@ async fn main() -> Result<()> {
             no_tui,
         )
         .await,
+        Commands::Update { check } => {
+            tokio::task::spawn_blocking(move || update::run_update(check))
+                .await
+                .context("update task failed")?
+        }
         Commands::Replay { id, local_host, db } => {
             let store = RequestStore::open(&db.unwrap_or_else(RequestStore::default_path))?;
             replay(&store, &id, &local_host).await
@@ -168,6 +182,28 @@ async fn run_serve(
         .collect::<Result<Vec<_>>>()?;
 
     let mut config = config::Config::load()?;
+    let update_notice = Arc::new(Mutex::new(None));
+    if config.should_check_updates() {
+        let notice = update_notice.clone();
+        tokio::spawn(async move {
+            let check = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(update::check_update_available),
+            )
+            .await;
+            if let Ok(mut config) = config::Config::load() {
+                let _ = config.record_update_check();
+            }
+            if let Ok(Ok(Ok(Some(version)))) = check
+                && let Ok(mut slot) = notice.lock()
+            {
+                *slot = Some(format!(
+                    "A new Vyse release is available ({version}). Run: vyse update"
+                ));
+            }
+        });
+    }
+
     let subdomain = config.ensure_subdomain(subdomain_flag)?;
     let machine_id = config.machine_id()?;
 
@@ -181,6 +217,7 @@ async fn run_serve(
         db_path: db.unwrap_or_else(RequestStore::default_path),
         tui: !no_tui && std::io::stdout().is_terminal(),
         machine_id: Some(machine_id),
+        update_notice: Some(update_notice),
     })
     .await
 }

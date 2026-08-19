@@ -4,7 +4,7 @@ mod tui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -35,6 +35,8 @@ pub struct TunnelOptions {
     pub db_path: PathBuf,
     pub tui: bool,
     pub machine_id: Option<String>,
+    /// Background update check may fill this for TUI footer / stdout notice.
+    pub update_notice: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl Default for TunnelOptions {
@@ -49,6 +51,7 @@ impl Default for TunnelOptions {
             db_path: RequestStore::default_path(),
             tui: false,
             machine_id: None,
+            update_notice: None,
         }
     }
 }
@@ -96,6 +99,7 @@ fn edge_hostname(edge: &str) -> String {
 pub struct TunnelSession {
     pub subdomain: String,
     pub public_url: String,
+    pub ephemeral: bool,
     pub routes: Vec<Route>,
     conn: quinn::Connection,
     local_host: String,
@@ -139,16 +143,17 @@ impl TunnelSession {
             .context("timed out waiting for edge registration")?
             .context("read registration reply")?;
 
-        let (subdomain, public_url) = match registered {
+        let (subdomain, public_url, ephemeral) = match registered {
             ControlMessage::Registered {
                 subdomain,
                 public_url,
-            } => (subdomain, public_url),
+                ephemeral,
+            } => (subdomain, public_url, ephemeral),
             ControlMessage::Error { message } => bail!("edge rejected tunnel: {message}"),
             other => bail!("unexpected control message: {other:?}"),
         };
 
-        info!(%subdomain, %public_url, "tunnel is live");
+        info!(%subdomain, %public_url, ephemeral, "tunnel is live");
 
         tokio::spawn(async move {
             keep_control_alive(send, recv).await;
@@ -157,6 +162,7 @@ impl TunnelSession {
         Ok(Self {
             subdomain,
             public_url,
+            ephemeral,
             routes,
             conn,
             local_host: opts.local_host,
@@ -191,10 +197,12 @@ impl TunnelSession {
 
 pub async fn run_tunnel(opts: TunnelOptions) -> Result<()> {
     let tui = opts.tui;
+    let update_notice = opts.update_notice.clone();
     let mut session = TunnelSession::connect(opts).await?;
+    let public_line = format_public_url(&session.public_url, session.ephemeral);
     println!();
     println!("  Vyse tunnel is live");
-    println!("  Public     -> {}", session.public_url);
+    println!("  Public     -> {public_line}");
     for route in &session.routes {
         println!(
             "  Route      -> {} -> {}:{}",
@@ -203,13 +211,17 @@ pub async fn run_tunnel(opts: TunnelOptions) -> Result<()> {
     }
     println!();
 
+    if !tui {
+        spawn_update_notice_printer(update_notice.clone());
+    }
+
     if tui {
         let (tx, rx) = std::sync::mpsc::channel();
         session.events = Some(tx);
-        let url = session.public_url.clone();
+        let url = public_line;
         let quit = Arc::new(AtomicBool::new(false));
         let quit_tui = quit.clone();
-        let tui_thread = std::thread::spawn(move || tui::run_tui(url, rx, quit_tui));
+        let tui_thread = std::thread::spawn(move || tui::run_tui(url, rx, quit_tui, update_notice));
         let result = session.serve().await;
         quit.store(true, Ordering::Relaxed);
         let _ = tui_thread.join();
@@ -217,6 +229,31 @@ pub async fn run_tunnel(opts: TunnelOptions) -> Result<()> {
     } else {
         session.serve().await
     }
+}
+
+fn format_public_url(public_url: &str, ephemeral: bool) -> String {
+    if ephemeral {
+        format!("{public_url} (random)")
+    } else {
+        public_url.to_string()
+    }
+}
+
+fn spawn_update_notice_printer(notice: Option<Arc<Mutex<Option<String>>>>) {
+    let Some(notice) = notice else {
+        return;
+    };
+    std::thread::spawn(move || {
+        for _ in 0..20 {
+            if let Ok(guard) = notice.lock()
+                && let Some(message) = guard.clone()
+            {
+                println!("\n{message}\n");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
 }
 
 async fn keep_control_alive(mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
@@ -263,12 +300,24 @@ async fn forward_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::edge_hostname;
+    use super::{edge_hostname, format_public_url};
 
     #[test]
     fn edge_hostname_splits_host_port() {
         assert_eq!(edge_hostname("vyse.chipling.xyz:4433"), "vyse.chipling.xyz");
         assert_eq!(edge_hostname("127.0.0.1:4433"), "127.0.0.1");
         assert_eq!(edge_hostname("[::1]:4433"), "::1");
+    }
+
+    #[test]
+    fn format_public_url_marks_ephemeral_tunnels() {
+        assert_eq!(
+            format_public_url("https://abcd1234.vyse.chipling.xyz", true),
+            "https://abcd1234.vyse.chipling.xyz (random)"
+        );
+        assert_eq!(
+            format_public_url("https://my-app.vyse.chipling.xyz", false),
+            "https://my-app.vyse.chipling.xyz"
+        );
     }
 }
