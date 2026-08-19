@@ -330,3 +330,56 @@ async fn chunked_origin_response_is_tunneled() {
     assert!(text.contains("chunk-ok"), "unexpected response: {text}");
     assert!(text.contains("Content-Length: 8"), "{text}");
 }
+
+#[tokio::test]
+async fn closing_the_tunnel_unregisters_immediately() {
+    let app_port = spawn_echo(b"live").await;
+    let (http_addr, quic_addr, _) = spawn_edge().await;
+
+    let session = TunnelSession::connect(TunnelOptions {
+        port: Some(app_port),
+        subdomain: Some("bye".into()),
+        edge: quic_addr.to_string(),
+        db_path: temp_db(),
+        tui: false,
+        ..TunnelOptions::default()
+    })
+    .await
+    .unwrap();
+    let conn = session.connection();
+    tokio::spawn(async move {
+        let _ = session.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut live = TcpStream::connect(http_addr).await.unwrap();
+    live.write_all(b"GET / HTTP/1.1\r\nHost: bye.vyse.dev\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut live_resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), live.read_to_end(&mut live_resp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&live_resp).contains("live"),
+        "{}",
+        String::from_utf8_lossy(&live_resp)
+    );
+
+    conn.close(0u32.into(), b"stopped");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut down = TcpStream::connect(http_addr).await.unwrap();
+    down.write_all(b"GET / HTTP/1.1\r\nHost: bye.vyse.dev\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut down_resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), down.read_to_end(&mut down_resp))
+        .await
+        .expect("down response timed out")
+        .unwrap();
+    let text = String::from_utf8_lossy(&down_resp);
+    assert!(text.contains("404"), "expected immediate 404, got: {text}");
+    assert!(text.contains("no active tunnel"));
+}

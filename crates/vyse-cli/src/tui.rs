@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -84,7 +84,7 @@ fn event_loop(
                 List::new(list_items).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("webhooks (last 50) — q quit"),
+                        .title("webhooks (last 50) — q / Ctrl+C quit"),
                 ),
                 chunks[1],
             );
@@ -95,10 +95,16 @@ fn event_loop(
         })?;
         if event::poll(Duration::from_millis(120))?
             && let Event::Key(key) = event::read()?
-            && key.code == KeyCode::Char('q')
         {
-            quit.store(true, std::sync::atomic::Ordering::Relaxed);
-            break;
+            let quit_key = matches!(
+                key.code,
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('Q')
+            ) || (key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL));
+            if quit_key {
+                quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
         }
     }
     Ok(())

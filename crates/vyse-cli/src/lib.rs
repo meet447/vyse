@@ -101,6 +101,7 @@ pub struct TunnelSession {
     pub public_url: String,
     pub ephemeral: bool,
     pub routes: Vec<Route>,
+    endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     local_host: String,
     store: RequestStore,
@@ -164,6 +165,7 @@ impl TunnelSession {
             public_url,
             ephemeral,
             routes,
+            endpoint,
             conn,
             local_host: opts.local_host,
             store,
@@ -171,27 +173,64 @@ impl TunnelSession {
         })
     }
 
+    /// Tell the edge this tunnel is gone so the public URL 404s immediately.
+    pub fn close(&self) {
+        self.conn.close(0u32.into(), b"stopped");
+    }
+
+    pub async fn wait_closed(&self) {
+        let _ = tokio::time::timeout(Duration::from_millis(400), self.endpoint.wait_idle()).await;
+    }
+
     pub async fn serve(self) -> Result<()> {
+        self.accept_until(Arc::new(AtomicBool::new(false)), false)
+            .await
+    }
+
+    pub async fn serve_until(self, quit: Arc<AtomicBool>) -> Result<()> {
+        self.accept_until(quit, true).await
+    }
+
+    async fn accept_until(self, quit: Arc<AtomicBool>, catch_signals: bool) -> Result<()> {
         let local_host = self.local_host.clone();
         let store = self.store.clone();
         let events = self.events.clone();
         loop {
-            match self.conn.accept_bi().await {
-                Ok((send, recv)) => {
-                    let local_host = local_host.clone();
-                    let store = store.clone();
-                    let events = events.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) =
-                            forward_stream(send, recv, &local_host, &store, events.as_ref()).await
-                        {
-                            warn!(error = %err, "local forward failed");
+            tokio::select! {
+                _ = wait_process_shutdown(), if catch_signals => break,
+                _ = wait_flag(&quit) => break,
+                bi = self.conn.accept_bi() => {
+                    match bi {
+                        Ok((send, recv)) => {
+                            let local_host = local_host.clone();
+                            let store = store.clone();
+                            let events = events.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = forward_stream(
+                                    send,
+                                    recv,
+                                    &local_host,
+                                    &store,
+                                    events.as_ref(),
+                                )
+                                .await
+                                {
+                                    warn!(error = %err, "local forward failed");
+                                }
+                            });
                         }
-                    });
+                        Err(_) => break,
+                    }
                 }
-                Err(err) => bail!("tunnel closed: {err}"),
             }
         }
+        self.close();
+        self.wait_closed().await;
+        Ok(())
+    }
+
+    pub fn connection(&self) -> quinn::Connection {
+        self.conn.clone()
     }
 }
 
@@ -222,12 +261,14 @@ pub async fn run_tunnel(opts: TunnelOptions) -> Result<()> {
         let quit = Arc::new(AtomicBool::new(false));
         let quit_tui = quit.clone();
         let tui_thread = std::thread::spawn(move || tui::run_tui(url, rx, quit_tui, update_notice));
-        let result = session.serve().await;
+        let result = session.serve_until(quit.clone()).await;
         quit.store(true, Ordering::Relaxed);
         let _ = tui_thread.join();
         result
     } else {
-        session.serve().await
+        session
+            .serve_until(Arc::new(AtomicBool::new(false)))
+            .await
     }
 }
 
@@ -236,6 +277,46 @@ fn format_public_url(public_url: &str, ephemeral: bool) -> String {
         format!("{public_url} (random)")
     } else {
         public_url.to_string()
+    }
+}
+
+async fn wait_flag(flag: &AtomicBool) {
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_process_shutdown() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = ctrl_c.await;
+                return;
+            }
+        };
+        let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = ctrl_c.await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
     }
 }
 
