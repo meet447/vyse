@@ -60,6 +60,18 @@ vyse update --check  # print status only
 vyse serve 3000 --route "/api=8000" --route "/=3000"
 ```
 
+**UDP over MASQUE** — advertise a local UDP port and reach it with HTTP/3 `CONNECT-UDP` (RFC 9298). Only loopback targets on ports you passed to `--udp` are allowed:
+
+```bash
+vyse serve 3000 --udp 5353
+```
+
+Template:
+
+```text
+https://my-app.vyse.chipling.xyz/.well-known/masque/udp/127.0.0.1/5353/
+```
+
 Manual downloads: [GitHub Releases](https://github.com/meet447/vyse/releases/latest).
 
 ## Open source / self-host

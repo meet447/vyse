@@ -50,6 +50,7 @@ mod tests {
             subdomain: Some("demo".into()),
             routes: vec![crate::protocol::Route::catch_all(3000)],
             machine_id: Some("hw-test".into()),
+            udp_ports: Vec::new(),
         };
         write_msg(&mut a, &original).await.unwrap();
         let decoded = read_msg(&mut b).await.unwrap();

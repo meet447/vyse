@@ -4,6 +4,7 @@
 //! length-prefixed JSON [`protocol::ControlMessage`]s.
 //! Data plane: the edge opens one bidirectional stream per public HTTP request.
 //! Each data stream starts with a 2-byte local port, then a raw HTTP/1.1 message.
+//! UDP (MASQUE) sessions use a `VU01` stream header plus QUIC datagrams.
 
 pub mod crypto;
 pub mod frame;
@@ -13,6 +14,8 @@ pub mod proxy;
 pub mod quic;
 pub mod routes;
 pub mod stream;
+pub mod udp;
+pub mod varint;
 
 pub use protocol::ALPN_VYSE;
 pub use quic::ALPN_H3;

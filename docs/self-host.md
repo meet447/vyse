@@ -57,6 +57,21 @@ vyse serve 3000 --route "/api=8000" --route "/=3000" \
   --edge 127.0.0.1:4433 --server-name localhost --subdomain my-app
 ```
 
+Advertise a local UDP port for RFC 9298 CONNECT-UDP on the HTTP/3 listener:
+
+```bash
+vyse serve 3000 --udp 5353 \
+  --edge 127.0.0.1:4433 --server-name localhost --subdomain my-app
+```
+
+MASQUE clients connect to:
+
+```text
+https://my-app.localhost/.well-known/masque/udp/127.0.0.1/5353/
+```
+
+The edge only forwards to loopback (`127.0.0.1`, `localhost`, `::1`) on ports listed in `--udp`.
+
 ## Persistent subdomain claims (optional)
 
 By default, subdomain ownership is in-memory only. To persist reserved names across edge restarts, pass a SQLite path:

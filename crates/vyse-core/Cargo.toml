@@ -7,6 +7,7 @@ description = "Shared protocol, crypto, and QUIC helpers for the Vyse tunnel"
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 httparse.workspace = true
 quinn.workspace = true
 rand.workspace = true

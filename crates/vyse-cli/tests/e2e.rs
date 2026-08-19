@@ -383,3 +383,149 @@ async fn closing_the_tunnel_unregisters_immediately() {
     assert!(text.contains("404"), "expected immediate 404, got: {text}");
     assert!(text.contains("no active tunnel"));
 }
+
+async fn spawn_udp_echo() -> u16 {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, peer)) => {
+                    let _ = socket.send_to(&buf[..n], peer).await;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn masque_udp_datagrams_round_trip() {
+    let app_port = spawn_echo(b"http").await;
+    let udp_port = spawn_udp_echo().await;
+    let (_, quic_addr, http3_addr) = spawn_edge().await;
+
+    let session = TunnelSession::connect(TunnelOptions {
+        port: Some(app_port),
+        subdomain: Some("masque".into()),
+        edge: quic_addr.to_string(),
+        db_path: temp_db(),
+        tui: false,
+        udp_ports: vec![udp_port],
+        ..TunnelOptions::default()
+    })
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = session.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let endpoint = vyse_core::quic::http3_client_endpoint().unwrap();
+    let conn = endpoint
+        .connect(http3_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let quic_conn = conn.clone();
+    let mut builder = h3::client::builder();
+    builder.enable_extended_connect(true);
+    builder.enable_datagram(true);
+    let (mut driver, mut send_request) = builder
+        .build::<_, _, bytes::Bytes>(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let mut req = http::Request::builder()
+        .method("CONNECT")
+        .uri(format!(
+            "https://masque.vyse.dev/.well-known/masque/udp/127.0.0.1/{udp_port}/"
+        ))
+        .body(())
+        .unwrap();
+    req.extensions_mut()
+        .insert(h3::ext::Protocol::CONNECT_UDP);
+    let mut stream = send_request.send_request(req).await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+        .await
+        .expect("CONNECT-UDP response timed out")
+        .unwrap();
+    assert_eq!(resp.status(), 200, "expected 200 CONNECT-UDP");
+
+    let quarter = stream.id().index();
+    let framed = vyse_core::udp::encode_h3_udp_datagram(quarter, b"ping-masque").unwrap();
+    quic_conn.send_datagram(framed).unwrap();
+
+    let echoed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let buf = quic_conn.read_datagram().await.unwrap();
+            if let Some((q, payload)) = vyse_core::udp::decode_h3_udp_datagram(&buf)
+                && q == quarter
+            {
+                return payload.to_vec();
+            }
+        }
+    })
+    .await
+    .expect("UDP echo timed out");
+    assert_eq!(echoed, b"ping-masque");
+}
+
+#[tokio::test]
+async fn masque_rejects_non_loopback_target() {
+    let app_port = spawn_echo(b"http").await;
+    let udp_port = spawn_udp_echo().await;
+    let (_, quic_addr, http3_addr) = spawn_edge().await;
+
+    let session = TunnelSession::connect(TunnelOptions {
+        port: Some(app_port),
+        subdomain: Some("locked".into()),
+        edge: quic_addr.to_string(),
+        db_path: temp_db(),
+        tui: false,
+        udp_ports: vec![udp_port],
+        ..TunnelOptions::default()
+    })
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = session.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let endpoint = vyse_core::quic::http3_client_endpoint().unwrap();
+    let conn = endpoint
+        .connect(http3_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut builder = h3::client::builder();
+    builder.enable_extended_connect(true);
+    builder.enable_datagram(true);
+    let (mut driver, mut send_request) = builder
+        .build::<_, _, bytes::Bytes>(h3_quinn::Connection::new(conn))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+
+    let mut req = http::Request::builder()
+        .method("CONNECT")
+        .uri("https://locked.vyse.dev/.well-known/masque/udp/8.8.8.8/53/")
+        .body(())
+        .unwrap();
+    req.extensions_mut()
+        .insert(h3::ext::Protocol::CONNECT_UDP);
+    let mut stream = send_request.send_request(req).await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response())
+        .await
+        .expect("CONNECT-UDP response timed out")
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}

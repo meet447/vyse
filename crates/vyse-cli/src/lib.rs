@@ -2,21 +2,27 @@ mod replay;
 mod store;
 mod tui;
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use vyse_core::frame::{read_msg, write_msg};
 use vyse_core::http::{read_http_response, request_method, response_status};
 use vyse_core::protocol::{ControlMessage, Route};
 use vyse_core::quic::tunnel_client_endpoint;
-use vyse_core::stream::read_port_header;
+use vyse_core::udp::{
+    UDP_ERROR, UDP_OPEN_MAGIC, UDP_READY, decode_tunnel_datagram, encode_tunnel_datagram,
+    masque_udp_url, read_udp_open_after_magic,
+};
 
 use crate::store::LoggedRequest;
 
@@ -37,6 +43,8 @@ pub struct TunnelOptions {
     pub machine_id: Option<String>,
     /// Background update check may fill this for TUI footer / stdout notice.
     pub update_notice: Option<Arc<Mutex<Option<String>>>>,
+    /// Local UDP ports advertised for MASQUE CONNECT-UDP.
+    pub udp_ports: Vec<u16>,
 }
 
 impl Default for TunnelOptions {
@@ -52,6 +60,7 @@ impl Default for TunnelOptions {
             tui: false,
             machine_id: None,
             update_notice: None,
+            udp_ports: Vec::new(),
         }
     }
 }
@@ -101,11 +110,13 @@ pub struct TunnelSession {
     pub public_url: String,
     pub ephemeral: bool,
     pub routes: Vec<Route>,
+    pub udp_ports: Vec<u16>,
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     local_host: String,
     store: RequestStore,
     events: Option<std::sync::mpsc::Sender<LoggedRequest>>,
+    udp_inbox: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
 }
 
 impl TunnelSession {
@@ -128,6 +139,7 @@ impl TunnelSession {
             .await
             .context("QUIC handshake with edge")?;
 
+        let udp_ports = opts.udp_ports.clone();
         let (mut send, mut recv) = conn.open_bi().await.context("open control stream")?;
         write_msg(
             &mut send,
@@ -135,6 +147,7 @@ impl TunnelSession {
                 subdomain: opts.subdomain.clone(),
                 routes: routes.clone(),
                 machine_id: opts.machine_id.clone(),
+                udp_ports: udp_ports.clone(),
             },
         )
         .await?;
@@ -160,16 +173,21 @@ impl TunnelSession {
             keep_control_alive(send, recv).await;
         });
 
+        let udp_inbox = Arc::new(Mutex::new(HashMap::new()));
+        spawn_cli_datagram_reader(conn.clone(), udp_inbox.clone());
+
         Ok(Self {
             subdomain,
             public_url,
             ephemeral,
             routes,
+            udp_ports,
             endpoint,
             conn,
             local_host: opts.local_host,
             store,
             events: None,
+            udp_inbox,
         })
     }
 
@@ -195,6 +213,8 @@ impl TunnelSession {
         let local_host = self.local_host.clone();
         let store = self.store.clone();
         let events = self.events.clone();
+        let udp_inbox = self.udp_inbox.clone();
+        let conn = self.conn.clone();
         loop {
             tokio::select! {
                 _ = wait_process_shutdown(), if catch_signals => break,
@@ -205,13 +225,17 @@ impl TunnelSession {
                             let local_host = local_host.clone();
                             let store = store.clone();
                             let events = events.clone();
+                            let udp_inbox = udp_inbox.clone();
+                            let conn = conn.clone();
                             tokio::spawn(async move {
                                 if let Err(err) = forward_stream(
                                     send,
                                     recv,
+                                    conn,
                                     &local_host,
                                     &store,
                                     events.as_ref(),
+                                    udp_inbox,
                                 )
                                 .await
                                 {
@@ -246,6 +270,16 @@ pub async fn run_tunnel(opts: TunnelOptions) -> Result<()> {
         println!(
             "  Route      -> {} -> {}:{}",
             route.path_prefix, session.local_host, route.port
+        );
+    }
+    for port in &session.udp_ports {
+        println!(
+            "  MASQUE     -> {}",
+            masque_udp_url(&session.public_url, *port)
+        );
+        println!(
+            "  UDP        -> {}:{} (CONNECT-UDP only)",
+            session.local_host, port
         );
     }
     println!();
@@ -350,18 +384,52 @@ async fn keep_control_alive(mut send: quinn::SendStream, mut recv: quinn::RecvSt
     }
 }
 
+fn spawn_cli_datagram_reader(
+    conn: quinn::Connection,
+    inbox: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match conn.read_datagram().await {
+                Ok(buf) => {
+                    if let Some((session_id, payload)) = decode_tunnel_datagram(&buf)
+                        && let Ok(map) = inbox.lock()
+                        && let Some(tx) = map.get(&session_id)
+                    {
+                        let _ = tx.send(Bytes::copy_from_slice(payload));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 async fn forward_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    conn: quinn::Connection,
     local_host: &str,
     store: &RequestStore,
     events: Option<&std::sync::mpsc::Sender<LoggedRequest>>,
+    udp_inbox: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
 ) -> Result<()> {
-    let port = read_port_header(&mut recv).await?;
-    let request = recv
+    let mut prefix = [0u8; 4];
+    recv.read_exact(&mut prefix)
+        .await
+        .context("read stream prefix")?;
+    if &prefix == UDP_OPEN_MAGIC {
+        let (port, session_id) = read_udp_open_after_magic(&mut recv).await?;
+        return forward_udp(send, recv, conn, local_host, port, session_id, udp_inbox).await;
+    }
+
+    let port = u16::from_be_bytes([prefix[0], prefix[1]]);
+    let mut request = prefix[2..].to_vec();
+    let rest = recv
         .read_to_end(32 * 1024 * 1024)
         .await
         .context("read tunneled HTTP request")?;
+    request.extend_from_slice(&rest);
     let method = request_method(&request).unwrap_or_else(|| "GET".into());
 
     let mut tcp = TcpStream::connect((local_host, port))
@@ -376,6 +444,78 @@ async fn forward_stream(
     }
     send.write_all(&response).await?;
     send.finish()?;
+    Ok(())
+}
+
+async fn forward_udp(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    conn: quinn::Connection,
+    local_host: &str,
+    port: u16,
+    session_id: u32,
+    udp_inbox: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
+) -> Result<()> {
+    let target = (local_host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve UDP target {local_host}:{port}"))?
+        .next()
+        .with_context(|| format!("no address for {local_host}:{port}"))?;
+    let bind_addr = if target.is_ipv6() {
+        "[::1]:0"
+    } else {
+        "127.0.0.1:0"
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(err) => {
+            warn!(error = %err, %port, "bind UDP session socket failed");
+            let _ = send.write_all(&[UDP_ERROR]).await;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    send.write_all(&[UDP_READY]).await?;
+
+    let (tx, mut from_edge) = mpsc::unbounded_channel();
+    {
+        let mut map = udp_inbox.lock().expect("udp inbox lock");
+        map.insert(session_id, tx);
+    }
+
+    let mut buf = vec![0u8; 65535];
+    let mut closed_byte = [0u8; 1];
+    loop {
+        tokio::select! {
+            incoming = from_edge.recv() => {
+                let Some(payload) = incoming else { break };
+                let _ = socket.send_to(&payload, target).await;
+            }
+            result = socket.recv_from(&mut buf) => {
+                match result {
+                    Ok((n, _)) => {
+                        let framed = encode_tunnel_datagram(session_id, &buf[..n]);
+                        if conn.max_datagram_size().is_some_and(|max| framed.len() > max) {
+                            continue;
+                        }
+                        let _ = conn.send_datagram(framed);
+                    }
+                    Err(_) => break,
+                }
+            }
+            closed = recv.read(&mut closed_byte) => {
+                match closed {
+                    Ok(None) | Err(_) => break,
+                    Ok(Some(_)) => {}
+                }
+            }
+        }
+    }
+
+    if let Ok(mut map) = udp_inbox.lock() {
+        map.remove(&session_id);
+    }
+    let _ = send.finish();
     Ok(())
 }
 

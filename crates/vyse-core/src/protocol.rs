@@ -51,6 +51,9 @@ pub enum ControlMessage {
         /// Stable hardware id used to bind a subdomain to one machine.
         #[serde(default)]
         machine_id: Option<String>,
+        /// Local UDP ports advertised for MASQUE CONNECT-UDP.
+        #[serde(default)]
+        udp_ports: Vec<u16>,
     },
     Registered {
         subdomain: String,
@@ -121,5 +124,15 @@ mod tests {
         let route = Route::parse("/api=8000").unwrap();
         assert_eq!(route.path_prefix, "/api");
         assert_eq!(route.port, 8000);
+    }
+
+    #[test]
+    fn register_without_udp_ports_still_deserializes() {
+        let json = r#"{"type":"register","subdomain":"demo","routes":[],"machine_id":"hw"}"#;
+        let msg: ControlMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMessage::Register { udp_ports, .. } => assert!(udp_ports.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

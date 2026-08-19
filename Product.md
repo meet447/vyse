@@ -36,7 +36,7 @@ Ship after v1. Do not block the first version on these.
 
 | Add-on | Role |
 | --- | --- |
-| **MASQUE (RFC 9298) UDP datagrams** | Native WebRTC / DNS / game UDP over the tunnel. |
+| **MASQUE (RFC 9298) UDP datagrams** | HTTP/3 CONNECT-UDP to registered local UDP ports. Raw public UDP still later. |
 | **Wasm edge middleware** | In-flight PII redaction, header injection, JWT/OIDC at the edge. |
 | **eBPF `sock_ops`** | Kernel-level local routing without binding extra ports. |
 | **Distributed control plane** | Raft/Redis registry, API tokens, multi-node edge. |
@@ -50,7 +50,7 @@ Ship after v1. Do not block the first version on these.
 | **QUIC** | CLI ↔ edge transport, connection migration, stream multiplexing | v1 |
 | **HTTP/3** | Public-facing protocol at the edge | v1 |
 | **HTTP/1.1** | Public compatibility + local-app dialect (almost every `localhost` server) | v1 |
-| **MASQUE** | Arbitrary UDP/TCP datagram proxying | add-on |
+| **MASQUE** | HTTP/3 CONNECT-UDP to advertised local UDP ports | shipped (add-on) |
 | **eBPF (`sock_ops`)** | Sidecar-less kernel redirection | add-on |
 | **WebAssembly** | Sandboxed edge middleware | add-on |
 
@@ -108,7 +108,7 @@ Vyse CLI  →  localhost:3000 / :8000 / …
 
 ### Explicitly not v1
 
-* [ ] MASQUE UDP
+* [x] MASQUE UDP (RFC 9298 CONNECT-UDP on HTTP/3, registered local ports only)
 * [ ] Wasmtime edge plugins
 * [ ] eBPF `sock_ops`
 * [ ] Raft/Redis / SPIFFE

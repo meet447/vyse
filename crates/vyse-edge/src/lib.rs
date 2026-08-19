@@ -1,12 +1,15 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use dashmap::DashMap;
 use quinn::Connection;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use vyse_core::frame::{read_msg, write_msg};
 use vyse_core::http::{
@@ -16,6 +19,7 @@ use vyse_core::protocol::{ControlMessage, Route, random_subdomain, validate_subd
 use vyse_core::quic::{http3_server_endpoint, tunnel_server_endpoint};
 use vyse_core::routes::match_route;
 use vyse_core::stream::write_port_header;
+use vyse_core::udp::{UDP_ERROR, UDP_READY, decode_tunnel_datagram, write_udp_open};
 use vyse_core::{DEFAULT_DOMAIN, DEFAULT_HTTP_PORT, DEFAULT_HTTP3_PORT, DEFAULT_QUIC_PORT};
 
 mod claims;
@@ -57,6 +61,9 @@ impl Default for EdgeConfig {
 pub(crate) struct Tunnel {
     pub conn: Connection,
     pub routes: Vec<Route>,
+    pub udp_ports: Vec<u16>,
+    pub udp_inbox: Arc<DashMap<u32, mpsc::UnboundedSender<Bytes>>>,
+    pub next_udp_session: Arc<AtomicU32>,
 }
 
 #[derive(Clone, Default)]
@@ -397,6 +404,67 @@ pub(crate) async fn forward_to_tunnel(
         .context("read tunneled HTTP response")
 }
 
+fn spawn_tunnel_datagram_reader(
+    conn: Connection,
+    inbox: Arc<DashMap<u32, mpsc::UnboundedSender<Bytes>>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match conn.read_datagram().await {
+                Ok(buf) => {
+                    if let Some((session_id, payload)) = decode_tunnel_datagram(&buf)
+                        && let Some(tx) = inbox.get(&session_id)
+                    {
+                        let _ = tx.send(Bytes::copy_from_slice(payload));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+pub(crate) struct UdpSession {
+    pub session_id: u32,
+    pub from_cli: mpsc::UnboundedReceiver<Bytes>,
+    _open_send: quinn::SendStream,
+    _open_recv: quinn::RecvStream,
+}
+
+pub(crate) async fn open_udp_session(tunnel: &Tunnel, port: u16) -> Result<UdpSession> {
+    if !tunnel.udp_ports.contains(&port) {
+        bail!("udp port {port} is not advertised on this tunnel");
+    }
+    let session_id = tunnel.next_udp_session.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::unbounded_channel();
+    tunnel.udp_inbox.insert(session_id, tx);
+
+    let (mut send, mut recv) = tunnel
+        .conn
+        .open_bi()
+        .await
+        .context("open UDP session stream")?;
+    write_udp_open(&mut send, port, session_id).await?;
+    let mut ack = [0u8; 1];
+    recv.read_exact(&mut ack)
+        .await
+        .context("read UDP session ack")?;
+    if ack[0] != UDP_READY {
+        tunnel.udp_inbox.remove(&session_id);
+        if ack[0] == UDP_ERROR {
+            bail!("CLI rejected UDP session for port {port}");
+        }
+        bail!("unexpected UDP session ack {}", ack[0]);
+    }
+
+    Ok(UdpSession {
+        session_id,
+        from_cli: rx,
+        _open_send: send,
+        _open_recv: recv,
+    })
+}
+
 async fn handle_tunnel(
     conn: Connection,
     registry: Registry,
@@ -413,12 +481,13 @@ async fn handle_tunnel(
         .context("waiting for CLI control stream")?;
 
     let msg = read_msg(&mut recv).await.context("read register message")?;
-    let (requested, routes, machine_id) = match msg {
+    let (requested, routes, machine_id, udp_ports) = match msg {
         ControlMessage::Register {
             subdomain,
             routes,
             machine_id,
-        } => (subdomain, routes, machine_id),
+            udp_ports,
+        } => (subdomain, routes, machine_id, udp_ports),
         other => {
             write_msg(
                 &mut send,
@@ -471,11 +540,16 @@ async fn handle_tunnel(
         }
     };
 
+    let udp_inbox = Arc::new(DashMap::new());
+    spawn_tunnel_datagram_reader(conn.clone(), udp_inbox.clone());
     if let Err(err) = registry.insert(
         subdomain.clone(),
         Tunnel {
             conn: conn.clone(),
             routes,
+            udp_ports,
+            udp_inbox,
+            next_udp_session: Arc::new(AtomicU32::new(1)),
         },
     ) {
         write_msg(

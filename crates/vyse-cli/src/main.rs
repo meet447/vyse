@@ -32,6 +32,9 @@ enum Commands {
         /// Path prefix to local port, e.g. /api=8000. Repeatable. Longest prefix wins.
         #[arg(long, value_name = "PATH=PORT")]
         route: Vec<String>,
+        /// Local UDP port to expose over HTTP/3 CONNECT-UDP. Repeatable.
+        #[arg(long, value_name = "PORT")]
+        udp: Vec<u16>,
         /// Requested subdomain (saved to config when omitted).
         #[arg(long, hide = true)]
         subdomain: Option<String>,
@@ -77,6 +80,9 @@ enum Commands {
         /// Path prefix to local port, e.g. /api=8000. Repeatable. Longest prefix wins.
         #[arg(long, value_name = "PATH=PORT")]
         route: Vec<String>,
+        /// Local UDP port to expose over HTTP/3 CONNECT-UDP. Repeatable.
+        #[arg(long, value_name = "PORT")]
+        udp: Vec<u16>,
         /// Requested subdomain (assigned randomly when omitted).
         #[arg(long)]
         subdomain: Option<String>,
@@ -117,6 +123,7 @@ async fn main() -> Result<()> {
         Commands::Serve {
             port,
             route,
+            udp,
             subdomain,
             edge,
             server_name,
@@ -126,6 +133,7 @@ async fn main() -> Result<()> {
         } => run_serve(
             Some(port),
             route,
+            udp,
             subdomain,
             edge,
             server_name,
@@ -137,6 +145,7 @@ async fn main() -> Result<()> {
         Commands::Tunnel {
             port,
             route,
+            udp,
             subdomain,
             edge,
             server_name,
@@ -146,6 +155,7 @@ async fn main() -> Result<()> {
         } => run_serve(
             port,
             route,
+            udp,
             subdomain,
             edge,
             server_name,
@@ -169,6 +179,7 @@ async fn main() -> Result<()> {
 async fn run_serve(
     port: Option<u16>,
     route: Vec<String>,
+    udp: Vec<u16>,
     subdomain_flag: Option<String>,
     edge: String,
     server_name: String,
@@ -218,6 +229,7 @@ async fn run_serve(
         tui: !no_tui && std::io::stdout().is_terminal(),
         machine_id: Some(machine_id),
         update_notice: Some(update_notice),
+        udp_ports: udp,
     })
     .await
 }

@@ -17,6 +17,8 @@ pub fn transport_config() -> TransportConfig {
     transport.max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
     transport.keep_alive_interval(Some(Duration::from_secs(15)));
     transport.max_concurrent_bidi_streams(1024u32.into());
+    transport.datagram_receive_buffer_size(Some(1024 * 1024));
+    transport.datagram_send_buffer_size(1024 * 1024);
     transport
 }
 
